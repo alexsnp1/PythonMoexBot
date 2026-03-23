@@ -11,8 +11,10 @@ import java.util.regex.Pattern;
 public class FormulaParser {
     // Full symbol token example: RUS:SV1!
     private static final Pattern FULL_SYMBOL_PATTERN = Pattern.compile("^[A-Z]+:([A-Z0-9!]+)$");
-    // Raw regex example: [A-Z]+:([A-Z0-9!]+)
+    // Normalized-symbol extracting pattern: extracts part after ':' (includes optional '!').
     private static final Pattern EXTRACT_SYMBOL_PATTERN = Pattern.compile("[A-Z]+:([A-Z0-9!]+)");
+    // TradingView symbol extracting pattern: extracts full token including prefix and optional '!'.
+    private static final Pattern TRADING_VIEW_SYMBOL_PATTERN = Pattern.compile("[A-Z]+:[A-Z0-9!]+");
 
     private enum Operator {
         MULTIPLY('*'),
@@ -67,6 +69,39 @@ public class FormulaParser {
         if (symbolTokenOrGroup == null) return "";
         // The extracted regex group includes the trailing '!'. Remove it.
         return symbolTokenOrGroup.replace("!", "").trim();
+    }
+
+    /**
+     * Normalizes a full TradingView-style symbol token for internal formula calculation.
+     * Examples:
+     * - RUS:SV1! -> SV1
+     * - TVC:SILVER -> SILVER
+     * - FX:USDCNH -> USDCNH
+     */
+    public String normalizeTradingViewSymbol(String tradingViewSymbol) {
+        if (tradingViewSymbol == null) return "";
+        String t = tradingViewSymbol.trim().toUpperCase();
+        int idx = t.indexOf(':');
+        if (idx >= 0 && idx + 1 < t.length()) {
+            t = t.substring(idx + 1);
+        }
+        return t.replace("!", "").trim();
+    }
+
+    /**
+     * Extracts full TradingView-style symbols exactly as tokens appear in formulas,
+     * keeping the prefix (e.g., RUS:, TVC:, FX:) and the optional trailing '!'.
+     */
+    public Set<String> extractTradingViewSymbols(String formula) {
+        if (formula == null || formula.isBlank()) {
+            throw new IllegalArgumentException("Formula must not be empty");
+        }
+        Set<String> out = new HashSet<>();
+        Matcher m = TRADING_VIEW_SYMBOL_PATTERN.matcher(formula.toUpperCase());
+        while (m.find()) {
+            out.add(m.group());
+        }
+        return out;
     }
 
     public double calculate(String formula, Map<String, Double> prices) {

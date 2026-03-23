@@ -28,9 +28,6 @@ public class Main {
         String telegramToken = AppConfig.requireEnv("TELEGRAM_BOT_TOKEN");
         String telegramUsername = AppConfig.requireEnv("TELEGRAM_BOT_USERNAME");
 
-        boolean mockPrices = AppConfig.getEnvOrDefaultBoolean("TRADINGVIEW_MOCK_PRICES", true);
-        String tradingViewEndpoint = AppConfig.getEnvOrDefault("TRADINGVIEW_PRICES_ENDPOINT", "");
-
         Path dbPath = AppConfig.dbPath();
         log.info("Using DB path: {}", dbPath);
 
@@ -40,8 +37,8 @@ public class Main {
         FormulaParser formulaParser = new FormulaParser();
         SpreadCalculator spreadCalculator = new SpreadCalculator(formulaParser);
 
-        TradingViewClient tvClient = new TradingViewClient(tradingViewEndpoint, mockPrices);
-        PriceService priceService = new PriceService(tvClient);
+        TradingViewClient tradingViewClient = new TradingViewClient();
+        PriceService priceService = new PriceService(tradingViewClient, formulaParser);
 
         List<CommandHandler> handlers = List.of(
                 new AddCommand(databaseService, formulaParser),

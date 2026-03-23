@@ -68,14 +68,15 @@ public class SpreadScheduler {
             List<SpreadRule> rules = databaseService.getAllRules();
             if (rules.isEmpty()) return;
 
-            Set<String> symbols = new HashSet<>();
+            Set<String> tradingViewSymbols = new HashSet<>();
             for (SpreadRule rule : rules) {
-                symbols.addAll(formulaParser.extractAndNormalizeSymbols(rule.getFormula()));
+                tradingViewSymbols.addAll(formulaParser.extractTradingViewSymbols(rule.getFormula()));
             }
 
-            if (symbols.isEmpty()) return;
+            if (tradingViewSymbols.isEmpty()) return;
 
-            Map<String, Double> prices = priceService.getPrices(symbols);
+            // PriceService returns normalized keys suitable for FormulaParser calculations.
+            Map<String, Double> prices = priceService.getPrices(tradingViewSymbols);
             if (prices.isEmpty()) {
                 log.warn("No prices fetched; skipping evaluation");
                 return;
