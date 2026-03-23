@@ -1,0 +1,8 @@
+target/
+secrets.properties
+*.iml
+.DS_Store
+
+src/main/java/bot/secrets.properties
+src/main/resources/secrets.properties
+
