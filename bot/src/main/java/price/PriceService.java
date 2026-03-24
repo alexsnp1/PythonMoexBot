@@ -6,6 +6,7 @@ import parser.FormulaParser;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -93,21 +94,42 @@ public class PriceService {
     private void refreshPricesFor(Set<String> requestedTradingViewSymbols) {
         long startedAt = System.currentTimeMillis();
         try {
-            Map<String, Double> tvPrices = tradingViewClient.getPrices(requestedTradingViewSymbols);
+            // Apply TradingView alias mapping before request.
+            Set<String> requestSymbols = new LinkedHashSet<>();
+            Map<String, Set<String>> reverseAliasMap = new HashMap<>();
+            for (String originalSymbol : requestedTradingViewSymbols) {
+                if (originalSymbol == null || originalSymbol.isBlank()) continue;
+                Set<String> symbolsForRequest = toTradingViewRequestSymbols(originalSymbol);
+                for (String symbolForRequest : symbolsForRequest) {
+                    requestSymbols.add(symbolForRequest);
+                    reverseAliasMap.computeIfAbsent(symbolForRequest, k -> new HashSet<>()).add(originalSymbol);
+                    if (!symbolForRequest.equals(originalSymbol)) {
+                        log.debug("TradingView alias mapping applied: originalSymbol={} requestSymbol={}",
+                                originalSymbol, symbolForRequest);
+                    }
+                }
+            }
+
+            Map<String, Double> tvPrices = tradingViewClient.getPrices(requestSymbols);
             if (tvPrices == null || tvPrices.isEmpty()) {
-                log.warn("TradingView returned empty response. requestedSymbolsCount={}", requestedTradingViewSymbols.size());
+                log.warn("TradingView returned empty response. requestedSymbolsCount={}", requestSymbols.size());
                 return;
             }
 
             Map<String, Double> fetchedNormalized = new HashMap<>();
             for (var entry : tvPrices.entrySet()) {
-                String tradingViewSymbol = entry.getKey();
+                String responseSymbol = entry.getKey();
                 Double price = entry.getValue();
-                if (tradingViewSymbol == null || price == null) continue;
+                if (responseSymbol == null || price == null) continue;
 
-                String normalized = formulaParser.normalizeTradingViewSymbol(tradingViewSymbol);
-                if (normalized == null || normalized.isBlank()) continue;
-                fetchedNormalized.put(normalized, price);
+                Set<String> originalSymbols = reverseAliasMap.getOrDefault(responseSymbol, Set.of(responseSymbol));
+                for (String originalSymbol : originalSymbols) {
+                    if (originalSymbol == null || originalSymbol.isBlank()) continue;
+
+                    String normalized = formulaParser.normalizeTradingViewSymbol(originalSymbol);
+                    if (normalized == null || normalized.isBlank()) continue;
+                    fetchedNormalized.put(normalized, price);
+                }
             }
 
             if (fetchedNormalized.isEmpty()) {
@@ -119,9 +141,18 @@ public class PriceService {
             // Missing symbols (requested but absent in TradingView response).
             for (String requested : requestedTradingViewSymbols) {
                 if (requested == null || requested.isBlank()) continue;
-                if (!tvPrices.containsKey(requested)) {
+                Set<String> mappedRequestedSet = toTradingViewRequestSymbols(requested);
+                boolean found = false;
+                for (String mappedRequested : mappedRequestedSet) {
+                    if (tvPrices.containsKey(mappedRequested)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
                     String normalized = formulaParser.normalizeTradingViewSymbol(requested);
-                    log.warn("TradingView price missing. tradingViewSymbol={} normalizedSymbol={}", requested, normalized);
+                    log.warn("TradingView price missing. tradingViewSymbol={} requestSymbol={} normalizedSymbol={}",
+                            requested, mappedRequestedSet, normalized);
                 }
             }
 
@@ -141,6 +172,23 @@ public class PriceService {
                 lastUpdateTimeMillis = startedAt;
             }
         }
+    }
+
+    private Set<String> toTradingViewRequestSymbols(String symbol) {
+        if (symbol == null) return Set.of();
+        String s = symbol.trim().toUpperCase();
+        // Alias mapping for non-standard provider prefix.
+        // Request multiple likely Brent symbols to maximize availability in scanner/global.
+        if ("VELOCITY:BRENT".equals(s)) {
+            Set<String> out = new LinkedHashSet<>();
+            out.add("TVC:UKOIL");
+            out.add("TVC:BRENT");
+            out.add("TVC:UKOIL1!");
+            out.add("ICEEUR:BRN1!");
+            out.add("OANDA:BCOUSD");
+            return out;
+        }
+        return Set.of(s);
     }
 
     private Map<String, Double> filterNormalized(Set<String> normalizedSymbols) {
