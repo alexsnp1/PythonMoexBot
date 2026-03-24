@@ -61,6 +61,10 @@ project/
    export DB_PATH="bot/spread-bot.sqlite"
    export POLL_INTERVAL_SECONDS=10
    export ALERT_COOLDOWN_SECONDS=60
+   export PRICE_PROVIDER="mock"  # or "tradingview"
+   export TRADINGVIEW_TIMEFRAME=1
+   export TRADINGVIEW_CANDLES=1
+   export MOEX_CONTRACT_CONFIG_PATH="price/moex_contracts.json"
    ```
 
 4. Run:
@@ -93,7 +97,10 @@ python -m unittest discover -s tests -v
 
 To replace mock prices:
 
-1. Implement a live connector in `price/price_service.py`.
-2. Replace `_fetch_from_source` to query a WebSocket/feed cache.
-3. Keep `get_prices` contract unchanged so scheduler code stays untouched.
+1. Set `PRICE_PROVIDER=tradingview`.
+2. Keep symbols in formulas exchange-prefixed (e.g. `RUS:BR1!`, `TVC:SILVER`).
+3. Service fetches TradingView prices in background threads via `tradingview-websocket` and keeps the same 10s cache contract.
+4. For MOEX continuous symbols (`SV1!`, `BR1!`), resolver maps them to configured real contracts from `price/moex_contracts.json` (front-contract rollover).
+
+If TradingView is temporarily unavailable, service falls back to mock value for that symbol to keep scheduler running.
 

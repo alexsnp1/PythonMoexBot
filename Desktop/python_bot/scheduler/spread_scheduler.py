@@ -58,22 +58,37 @@ class SpreadScheduler:
             return
 
         symbols: set[str] = set()
+        symbol_map: dict[str, str] = {}
         for rule in rules:
             symbols.update(self.parser.extract_symbols(rule.formula))
+            symbol_map.update(self.parser.extract_symbol_map(rule.formula))
         if not symbols:
             return
 
-        prices = self.price_service.get_prices(symbols)
+        prices = await self.price_service.get_prices(symbols, symbol_map=symbol_map)
+        price_sources = self.price_service.get_last_sources()
         now_ts = int(time.time())
 
         for rule in rules:
-            if rule.last_alert_time is not None and now_ts - rule.last_alert_time < self.cooldown_seconds:
-                continue
-
             try:
                 value = self.calculator.evaluate(rule.formula, prices)
             except Exception as exc:  # keep scheduler robust
                 self._logger.warning("Failed to evaluate rule %s: %s", rule.id, exc)
+                continue
+
+            rule_symbols = self.parser.extract_symbols(rule.formula)
+            source_details = ", ".join(
+                f"{sym}:{price_sources.get(sym, 'unknown')}" for sym in sorted(rule_symbols)
+            )
+            self._logger.info(
+                "Rule #%s source=%s symbols=%s value=%.6f",
+                rule.id,
+                self.price_service.provider,
+                source_details,
+                value,
+            )
+
+            if rule.last_alert_time is not None and now_ts - rule.last_alert_time < self.cooldown_seconds:
                 continue
 
             if value > rule.upper_bound:

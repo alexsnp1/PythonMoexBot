@@ -26,6 +26,17 @@ class FormulaParser:
         normalized = {normalize_symbol(sym) for sym in raw_symbols}
         return normalized
 
+    def extract_symbol_map(self, formula: str) -> Dict[str, str]:
+        """
+        Return normalized->raw mapping, e.g. {"BR1!": "RUS:BR1!"}.
+        First occurrence wins if duplicates appear.
+        """
+        symbol_map: Dict[str, str] = {}
+        for raw_symbol in SYMBOL_RE.findall(formula):
+            normalized = normalize_symbol(raw_symbol)
+            symbol_map.setdefault(normalized, raw_symbol)
+        return symbol_map
+
     def normalize_formula(self, formula: str) -> str:
         """Replace exchange-prefixed symbols by normalized symbol names."""
         def _replace(match: re.Match[str]) -> str:

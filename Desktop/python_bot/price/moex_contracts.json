@@ -1,0 +1,28 @@
+{
+  "aliases": {
+    "SV1!": "SV",
+    "SI1!": "SI",
+    "BR1!": "BR"
+  },
+  "rollover": {
+    "SV": [
+      { "contract": "SVH2026", "rollover_at": "2026-03-20" },
+      { "contract": "SVM2026", "rollover_at": "2026-06-20" },
+      { "contract": "SVU2026", "rollover_at": "2026-09-20" },
+      { "contract": "SVZ2026", "rollover_at": "2026-12-20" }
+    ],
+    "SI": [
+      { "contract": "SIH2026", "rollover_at": "2026-03-20" },
+      { "contract": "SIM2026", "rollover_at": "2026-06-20" },
+      { "contract": "SIU2026", "rollover_at": "2026-09-20" },
+      { "contract": "SIZ2026", "rollover_at": "2026-12-20" }
+    ],
+    "BR": [
+      { "contract": "BRH2026", "rollover_at": "2026-03-20" },
+      { "contract": "BRJ2026", "rollover_at": "2026-06-20" },
+      { "contract": "BRN2026", "rollover_at": "2026-09-20" },
+      { "contract": "BRV2026", "rollover_at": "2026-12-20" }
+    ]
+  }
+}
+
