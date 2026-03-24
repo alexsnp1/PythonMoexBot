@@ -1,8 +1,19 @@
+# Maven
 target/
-secrets.properties
+
+# IntelliJ
+.idea/
 *.iml
+
+# OS
 .DS_Store
 
-src/main/java/bot/secrets.properties
-src/main/resources/secrets.properties
+# Logs
+*.log
 
+# Database
+*.sqlite
+
+# Secrets (ВАЖНО)
+secrets.properties
+**/secrets.properties
