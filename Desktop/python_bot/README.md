@@ -101,6 +101,7 @@ To replace mock prices:
 2. Keep symbols in formulas exchange-prefixed (e.g. `RUS:BR1!`, `TVC:SILVER`).
 3. Service fetches TradingView prices in background threads via `tradingview-websocket` and keeps the same 10s cache contract.
 4. For MOEX continuous symbols (`SV1!`, `BR1!`), resolver maps them to configured real contracts from `price/moex_contracts.json` (front-contract rollover).
+5. For MOEX symbols, service resolves real contract (rollover config) and uses TradingView real-time `last` price (or bid/ask fallback), avoiding close/continuous approximation.
 
 If TradingView is temporarily unavailable, service falls back to mock value for that symbol to keep scheduler running.
 

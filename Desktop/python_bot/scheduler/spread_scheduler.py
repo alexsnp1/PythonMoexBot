@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -65,7 +66,15 @@ class SpreadScheduler:
         if not symbols:
             return
 
-        prices = await self.price_service.get_prices(symbols, symbol_map=symbol_map)
+        try:
+            prices = await self.price_service.get_prices(symbols, symbol_map=symbol_map)
+        except asyncio.CancelledError:
+            # Can happen if scheduler/job is interrupted while awaiting thread-backed fetch.
+            self._logger.warning("Price fetch was cancelled for current scheduler cycle")
+            return
+        except Exception as exc:
+            self._logger.warning("Price fetch failed for scheduler cycle: %s", exc)
+            return
         price_sources = self.price_service.get_last_sources()
         now_ts = int(time.time())
 

@@ -9,7 +9,7 @@ import string
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Dict, Iterable
+from typing import Any, Dict, Iterable
 
 import certifi
 
@@ -102,6 +102,9 @@ class PriceService:
     ) -> Dict[str, float]:
         tasks = []
         symbol_order: list[str] = []
+        raw_order: list[str] = []
+        resolved_order: list[str] = []
+        tv_order: list[str] = []
         for normalized in normalized_symbols:
             raw_symbol = symbol_map.get(normalized, normalized)
             resolved_symbol = self._contract_resolver.resolve_symbol(raw_symbol)
@@ -114,6 +117,9 @@ class PriceService:
                 tv_symbol,
             )
             symbol_order.append(normalized)
+            raw_order.append(raw_symbol)
+            resolved_order.append(resolved_symbol)
+            tv_order.append(tv_symbol)
             tasks.append(
                 asyncio.to_thread(
                     self._fetch_single_tradingview_price_sync,
@@ -123,7 +129,9 @@ class PriceService:
         prices = await asyncio.gather(*tasks, return_exceptions=True)
 
         result: Dict[str, float] = {}
-        for normalized, value in zip(symbol_order, prices):
+        for normalized, raw_symbol, resolved_symbol, tv_symbol, value in zip(
+            symbol_order, raw_order, resolved_order, tv_order, prices
+        ):
             if isinstance(value, Exception):
                 self._last_sources[normalized] = "mock_fallback"
                 self._logger.warning(
@@ -133,8 +141,16 @@ class PriceService:
                 )
                 result[normalized] = self._fetch_mock_price(normalized)
             else:
-                self._last_sources[normalized] = "tradingview"
+                self._last_sources[normalized] = "tradingview_real"
                 self._logger.info("TradingView fetch success for %s: %s", normalized, value)
+                self._logger.info(
+                    "%s -> %s -> %s -> %s -> %s",
+                    raw_symbol,
+                    normalized,
+                    resolved_symbol.split(":", 1)[-1] if ":" in resolved_symbol else resolved_symbol,
+                    tv_symbol,
+                    value,
+                )
                 result[normalized] = value
         return result
 
@@ -175,6 +191,8 @@ class PriceService:
                     exc,
                     traceback.format_exc(),
                 )
+                if "invalid_parameters" in str(exc):
+                    break
             finally:
                 if ws is not None:
                     try:
@@ -209,6 +227,8 @@ class PriceService:
                     "fractional",
                     "is_tradable",
                     "lp",
+                    "bid",
+                    "ask",
                     "lp_time",
                     "minmov",
                     "minmove2",
@@ -224,7 +244,8 @@ class PriceService:
                     "rtc",
                 ],
             ),
-            ("quote_add_symbols", [quote_session, tv_symbol, {"flags": ["force_permission"]}]),
+            # Keep quote_add_symbols minimal to avoid invalid_parameters for many symbols.
+            ("quote_add_symbols", [quote_session, tv_symbol]),
             ("resolve_symbol", [chart_session, f"symbol_{self._tv_timeframe}", symbol_string]),
             (
                 "create_series",
@@ -246,8 +267,14 @@ class PriceService:
     def _receive_tradingview_price(self, ws, tv_symbol: str) -> float:
         deadline = time.time() + self._TV_TIMEOUT_SECONDS
         while time.time() < deadline:
-            raw = ws.recv()
-            self._logger.info("TradingView message received for %s: %s", tv_symbol, raw[:500])
+            try:
+                raw = ws.recv()
+            except Exception as exc:
+                # Socket can briefly time out between messages; keep waiting until deadline.
+                self._logger.debug("TradingView recv transient timeout/error for %s: %s", tv_symbol, exc)
+                continue
+            self._logger.info("TradingView message received for %s", tv_symbol)
+            self._logger.debug("TradingView raw response for %s: %s", tv_symbol, raw)
             data_chunks = re.split(r"~m~\d+~m~", raw)
 
             for chunk in data_chunks:
@@ -259,45 +286,62 @@ class PriceService:
                 except json.JSONDecodeError:
                     continue
 
-                if payload.get("m") != "timescale_update":
-                    continue
+                if payload.get("m") == "critical_error":
+                    self._logger.warning("TradingView critical_error for %s: %s", tv_symbol, payload)
+                    params = payload.get("p", [])
+                    if len(params) >= 3 and params[2] == "quote_add_symbols":
+                        raise RuntimeError(f"TradingView invalid_parameters for quote_add_symbols: {payload}")
 
-                series_key = f"s{self._tv_timeframe}"
-                series = payload.get("p", [{}, {}])[1].get(series_key, {}).get("s", [])
-                if not series:
-                    continue
-
-                latest_candle = series[-1]
-                try:
-                    close_price = self._extract_close_price(latest_candle)
-                    return close_price
-                except Exception as exc:
-                    self._logger.warning(
-                        "TradingView candle parse failed for %s: %s | candle=%s",
-                        tv_symbol,
-                        exc,
-                        str(latest_candle)[:500],
-                    )
-                    continue
+                self._logger.debug("TradingView parsed payload for %s: %s", tv_symbol, payload)
+                selected = self._select_realtime_price(payload)
+                if selected is not None:
+                    return selected
 
         self._logger.warning("NO DATA FROM TRADINGVIEW for %s", tv_symbol)
         raise TimeoutError(f"No data from TradingView for {tv_symbol} in {self._TV_TIMEOUT_SECONDS}s")
 
     @staticmethod
-    def _extract_close_price(latest_candle) -> float:
-        # TradingView may return candles as list or dict with numeric string keys.
-        if isinstance(latest_candle, list):
-            return float(latest_candle[4])
-        if isinstance(latest_candle, dict):
-            if 4 in latest_candle:
-                return float(latest_candle[4])
-            if "4" in latest_candle:
-                return float(latest_candle["4"])
-            if "v" in latest_candle and isinstance(latest_candle["v"], list):
-                return float(latest_candle["v"][4])
-            if "close" in latest_candle:
-                return float(latest_candle["close"])
-        raise KeyError("close price key is missing in TradingView candle payload")
+    def _select_realtime_price(payload: Dict[str, Any]) -> float | None:
+        last_price = PriceService._find_first_numeric_by_keys(payload, {"last", "lp", "last_price"})
+        if last_price is not None:
+            return last_price
+
+        bid = PriceService._find_first_numeric_by_keys(payload, {"bid", "bp", "bid_price"})
+        ask = PriceService._find_first_numeric_by_keys(payload, {"ask", "ap", "ask_price"})
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+        if bid is not None:
+            return bid
+        if ask is not None:
+            return ask
+        return None
+
+    @staticmethod
+    def _find_first_numeric_by_keys(data: Any, keys: set[str]) -> float | None:
+        stack: list[Any] = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if str(key).lower() in keys:
+                        parsed = PriceService._coerce_float(value)
+                        if parsed is not None:
+                            return parsed
+                    stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+        return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
     def _generate_session(prefix: str) -> str:

@@ -24,6 +24,8 @@ class MoexContractResolverTests(unittest.TestCase):
             resolver = MoexContractResolver(config_path=str(config_path))
             resolved = resolver.resolve_symbol("RUS:SV1!")
             self.assertEqual(resolved, "RUS:SVM2035")
+            resolved_plain = resolver.resolve_symbol("SV1!")
+            self.assertEqual(resolved_plain, "SVM2035")
 
     def test_keeps_symbol_when_no_mapping(self) -> None:
         resolver = MoexContractResolver(config_path=None)
