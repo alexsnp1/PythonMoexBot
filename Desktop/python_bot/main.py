@@ -53,6 +53,7 @@ async def run() -> None:
     tv_timeframe = os.getenv("TRADINGVIEW_TIMEFRAME", "1")
     tv_candles = int(os.getenv("TRADINGVIEW_CANDLES", "1"))
     moex_contract_config_path = os.getenv("MOEX_CONTRACT_CONFIG_PATH", "price/moex_contracts.json")
+    tradingview_auth_token = os.getenv("TRADINGVIEW_AUTH_TOKEN", "").strip()
 
     db = DatabaseService(db_path=db_path)
     db.initialize()
@@ -66,6 +67,7 @@ async def run() -> None:
         tradingview_timeframe=tv_timeframe,
         tradingview_candles=tv_candles,
         moex_contract_config_path=moex_contract_config_path,
+        tradingview_auth_token=tradingview_auth_token or None,
     )
     calculator = SpreadCalculator(parser=parser)
     spread_scheduler = SpreadScheduler(

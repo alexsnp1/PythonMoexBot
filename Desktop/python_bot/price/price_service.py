@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import string
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from typing import Any, Dict, Iterable
 import certifi
 
 from price.moex_contract_resolver import MoexContractResolver
+
+
 @dataclass(slots=True)
 class PriceSnapshot:
     value: float
@@ -23,7 +26,7 @@ class PriceSnapshot:
 class PriceService:
     """
     Price source with simple in-memory cache.
-    Currently returns mock prices; replace `_fetch_from_source` for live data.
+    mock provider returns synthetic prices; tradingview uses one shared WebSocket.
     """
 
     _EXCHANGE_REMAP = {
@@ -40,6 +43,7 @@ class PriceService:
         tradingview_timeframe: str = "1",
         tradingview_candles: int = 1,
         moex_contract_config_path: str | None = None,
+        tradingview_auth_token: str | None = None,
     ) -> None:
         self._cache_ttl = cache_ttl_seconds
         self._provider = provider
@@ -49,6 +53,19 @@ class PriceService:
         self._last_sources: dict[str, str] = {}
         self._contract_resolver = MoexContractResolver(config_path=moex_contract_config_path)
         self._logger = logging.getLogger(self.__class__.__name__)
+        raw_auth = (tradingview_auth_token or "").strip()
+        self._tv_auth_token = raw_auth
+
+        self._tv_lock = threading.RLock()
+        self._tv_ws: Any = None
+        self._tv_quote_session: str | None = None
+        self._tv_reader_stop = threading.Event()
+        self._tv_reader_thread: threading.Thread | None = None
+        self._tv_prices: dict[str, float] = {}
+        self._tv_subscribed: set[str] = set()
+        self._tv_symbol_to_normalized: dict[str, str] = {}
+        self._tv_auth_mode_logged = False
+        self._tv_subscriptions_logged = False
 
     async def get_prices(
         self,
@@ -72,7 +89,9 @@ class PriceService:
 
         if stale_symbols:
             if self._provider == "tradingview":
-                fetched = await self._fetch_from_tradingview(stale_symbols, symbol_map or {})
+                fetched = await asyncio.to_thread(
+                    self._fetch_tradingview_batch_sync, stale_symbols, symbol_map or {}
+                )
             else:
                 fetched = {}
                 for symbol in stale_symbols:
@@ -95,16 +114,32 @@ class PriceService:
         random.seed(symbol + str(int(time.time() / self._cache_ttl)))
         return round(random.uniform(10, 500), 5)
 
-    async def _fetch_from_tradingview(
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        t = token.strip()
+        if len(t) <= 6:
+            return "***"
+        return f"{t[:3]}***{t[-3:]}"
+
+    def _log_tv_auth_mode_once(self) -> None:
+        if self._tv_auth_mode_logged:
+            return
+        self._tv_auth_mode_logged = True
+        if self._tv_auth_token:
+            self._logger.info("TradingView auth mode: AUTHENTICATED")
+            self._logger.debug("TradingView token (masked): %s", self._mask_token(self._tv_auth_token))
+        else:
+            self._logger.info("TradingView auth mode: UNAUTHORIZED (delayed data)")
+
+    def _fetch_tradingview_batch_sync(
         self,
         normalized_symbols: list[str],
         symbol_map: Dict[str, str],
     ) -> Dict[str, float]:
-        tasks = []
+        self._log_tv_auth_mode_once()
         symbol_order: list[str] = []
-        raw_order: list[str] = []
-        resolved_order: list[str] = []
         tv_order: list[str] = []
+        tv_to_norm: dict[str, str] = {}
         for normalized in normalized_symbols:
             raw_symbol = symbol_map.get(normalized, normalized)
             resolved_symbol = self._contract_resolver.resolve_symbol(raw_symbol)
@@ -117,44 +152,98 @@ class PriceService:
                 tv_symbol,
             )
             symbol_order.append(normalized)
-            raw_order.append(raw_symbol)
-            resolved_order.append(resolved_symbol)
             tv_order.append(tv_symbol)
-            tasks.append(
-                asyncio.to_thread(
-                    self._fetch_single_tradingview_price_sync,
-                    tv_symbol,
-                )
-            )
-        prices = await asyncio.gather(*tasks, return_exceptions=True)
+            tv_to_norm[tv_symbol] = normalized
 
-        result: Dict[str, float] = {}
-        for normalized, raw_symbol, resolved_symbol, tv_symbol, value in zip(
-            symbol_order, raw_order, resolved_order, tv_order, prices
-        ):
-            if isinstance(value, Exception):
+        unique_tv = list(dict.fromkeys(tv_order))
+
+        if not self._tv_ensure_connection_with_backoff():
+            result: dict[str, float] = {}
+            for normalized in symbol_order:
+                self._logger.warning("fallback to mock for %s", normalized)
                 self._last_sources[normalized] = "mock_fallback"
-                self._logger.warning(
-                    "TradingView fetch failed for %s: fallback to mock (%s)",
-                    normalized,
-                    value,
-                )
                 result[normalized] = self._fetch_mock_price(normalized)
-            else:
+            return result
+
+        self._tv_subscribe_symbols(unique_tv, tv_to_norm)
+        deadline = time.time() + max(
+            self._TV_TIMEOUT_SECONDS,
+            self._TV_TIMEOUT_SECONDS * len(unique_tv) / 2,
+        )
+        result = {}
+        while time.time() < deadline:
+            missing: list[str] = []
+            with self._tv_lock:
+                for normalized, tv_symbol in zip(symbol_order, tv_order):
+                    if normalized in result:
+                        continue
+                    price = self._tv_prices.get(tv_symbol)
+                    if price is not None:
+                        result[normalized] = price
+                    else:
+                        missing.append(normalized)
+            if not missing:
+                break
+            time.sleep(0.05)
+
+        for normalized, tv_symbol in zip(symbol_order, tv_order):
+            if normalized in result:
                 self._last_sources[normalized] = "tradingview_real"
-                self._logger.info("TradingView fetch success for %s: %s", normalized, value)
-                self._logger.info(
-                    "%s -> %s -> %s -> %s -> %s",
-                    raw_symbol,
-                    normalized,
-                    resolved_symbol.split(":", 1)[-1] if ":" in resolved_symbol else resolved_symbol,
-                    tv_symbol,
-                    value,
-                )
-                result[normalized] = value
+                continue
+            self._logger.warning("fallback to mock for %s", normalized)
+            self._last_sources[normalized] = "mock_fallback"
+            result[normalized] = self._fetch_mock_price(normalized)
+
         return result
 
-    def _fetch_single_tradingview_price_sync(self, tv_symbol: str) -> float:
+    def _tv_ensure_connection_with_backoff(self) -> bool:
+        with self._tv_lock:
+            if self._tv_ws is not None and self._tv_is_ws_alive_unsafe():
+                return True
+
+        for attempt in (1, 2, 3):
+            if attempt == 2:
+                time.sleep(2)
+            elif attempt == 3:
+                time.sleep(5)
+            connect_ok = False
+            try:
+                self._tv_connect_and_start_reader()
+                with self._tv_lock:
+                    connect_ok = self._tv_ws is not None and self._tv_is_ws_alive_unsafe()
+            except Exception as exc:
+                self._logger.warning(
+                    "TradingView connect attempt %s/%s failed: %s\n%s",
+                    attempt,
+                    self._TV_MAX_RETRIES,
+                    exc,
+                    traceback.format_exc(),
+                )
+                with self._tv_lock:
+                    self._tv_close_internal_unlocked()
+                if "invalid_parameters" in str(exc):
+                    return False
+                continue
+            if connect_ok:
+                return True
+            with self._tv_lock:
+                self._tv_close_internal_unlocked()
+        return False
+
+    def _tv_is_ws_alive_unsafe(self) -> bool:
+        ws = self._tv_ws
+        if ws is None:
+            return False
+        try:
+            connected = getattr(ws, "connected", None)
+            if connected is not None:
+                return bool(connected)
+            sock = getattr(ws, "sock", None)
+            return sock is not None
+        except Exception:
+            return False
+
+    def _tv_connect_and_start_reader(self) -> None:
         try:
             from websocket import create_connection
         except ModuleNotFoundError as exc:
@@ -163,57 +252,27 @@ class PriceService:
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
 
-        last_error: Exception | None = None
-        for attempt in range(1, self._TV_MAX_RETRIES + 1):
-            ws = None
-            try:
-                self._logger.info(
-                    "TradingView connection open for %s (attempt %s/%s)",
-                    tv_symbol,
-                    attempt,
-                    self._TV_MAX_RETRIES,
-                )
-                ws = create_connection(
-                    self._TV_WS_URL,
-                    timeout=self._TV_TIMEOUT_SECONDS,
-                    sslopt={"cert_reqs": 2, "ca_certs": certifi.where()},
-                )
-                self._send_tradingview_subscription(ws=ws, tv_symbol=tv_symbol)
-                close_price = self._receive_tradingview_price(ws=ws, tv_symbol=tv_symbol)
-                return close_price
-            except Exception as exc:
-                last_error = exc
-                self._logger.warning(
-                    "TradingView attempt failed for %s (%s/%s): %s\n%s",
-                    tv_symbol,
-                    attempt,
-                    self._TV_MAX_RETRIES,
-                    exc,
-                    traceback.format_exc(),
-                )
-                if "invalid_parameters" in str(exc):
-                    break
-            finally:
-                if ws is not None:
-                    try:
-                        ws.close()
-                    except Exception:
-                        pass
+        token = self._tv_auth_token if self._tv_auth_token else "unauthorized_user_token"
+        with self._tv_lock:
+            self._tv_close_internal_unlocked()
+            self._logger.info("TradingView WebSocket opening (shared connection)")
+            ws = create_connection(
+                self._TV_WS_URL,
+                timeout=self._TV_TIMEOUT_SECONDS,
+                sslopt={"cert_reqs": 2, "ca_certs": certifi.where()},
+            )
+            quote_session = self._generate_session(prefix="qs_")
+            self._tv_ws = ws
+            self._tv_quote_session = quote_session
+            self._tv_subscribed.clear()
+            self._tv_prices.clear()
+            self._tv_symbol_to_normalized.clear()
+            self._tv_subscriptions_logged = False
 
-        if last_error is None:
-            raise RuntimeError(f"TradingView fetch failed for {tv_symbol} with unknown error")
-        raise RuntimeError(f"TradingView fetch failed for {tv_symbol}: {last_error}") from last_error
-
-    def _send_tradingview_subscription(self, ws, tv_symbol: str) -> None:
-        quote_session = self._generate_session(prefix="qs_")
-        chart_session = self._generate_session(prefix="cs_")
-        symbol_string = f'={{"symbol":"{tv_symbol}","adjustment":"splits"}}'
-
-        messages = [
-            ("set_auth_token", ["unauthorized_user_token"]),
-            ("chart_create_session", [chart_session, ""]),
-            ("quote_create_session", [quote_session]),
-            (
+            self._tv_send_unlocked(ws, "set_auth_token", [token])
+            self._tv_send_unlocked(ws, "quote_create_session", [quote_session])
+            self._tv_send_unlocked(
+                ws,
                 "quote_set_fields",
                 [
                     quote_session,
@@ -243,62 +302,180 @@ class PriceService:
                     "rchp",
                     "rtc",
                 ],
-            ),
-            # Keep quote_add_symbols minimal to avoid invalid_parameters for many symbols.
-            ("quote_add_symbols", [quote_session, tv_symbol]),
-            ("resolve_symbol", [chart_session, f"symbol_{self._tv_timeframe}", symbol_string]),
-            (
-                "create_series",
-                [
-                    chart_session,
-                    f"s{self._tv_timeframe}",
-                    f"s{self._tv_timeframe}",
-                    f"symbol_{self._tv_timeframe}",
-                    self._tv_timeframe,
-                    self._tv_candles,
-                ],
-            ),
-        ]
+            )
+            self._logger.info("TradingView WebSocket connected")
 
-        for func, params in messages:
-            ws.send(self._tv_create_message(func=func, param_list=params))
-        self._logger.info("TradingView subscription sent for %s", tv_symbol)
+        self._ensure_tv_reader_thread()
 
-    def _receive_tradingview_price(self, ws, tv_symbol: str) -> float:
-        deadline = time.time() + self._TV_TIMEOUT_SECONDS
-        while time.time() < deadline:
+    def _tv_close_internal_unlocked(self) -> None:
+        if self._tv_ws is not None:
             try:
-                raw = ws.recv()
-            except Exception as exc:
-                # Socket can briefly time out between messages; keep waiting until deadline.
-                self._logger.debug("TradingView recv transient timeout/error for %s: %s", tv_symbol, exc)
-                continue
-            self._logger.info("TradingView message received for %s", tv_symbol)
-            self._logger.debug("TradingView raw response for %s: %s", tv_symbol, raw)
-            data_chunks = re.split(r"~m~\d+~m~", raw)
+                self._tv_ws.close()
+            except Exception:
+                pass
+            self._logger.info("TradingView WebSocket closed")
+        self._tv_ws = None
+        self._tv_quote_session = None
 
-            for chunk in data_chunks:
-                chunk = chunk.strip()
-                if not chunk:
+    def _tv_send_unlocked(self, ws: Any, func: str, param_list: list) -> None:
+        ws.send(self._tv_create_message(func=func, param_list=param_list))
+
+    def _tv_subscribe_symbols(self, tv_symbols: list[str], tv_to_norm: dict[str, str]) -> None:
+        new_syms: list[str] = []
+        with self._tv_lock:
+            ws = self._tv_ws
+            qs = self._tv_quote_session
+            if ws is None or qs is None:
+                return
+            for tv in tv_symbols:
+                self._tv_symbol_to_normalized[tv] = tv_to_norm.get(tv, tv)
+                if tv in self._tv_subscribed:
+                    continue
+                chart_session = self._generate_session(prefix="cs_")
+                symbol_string = f'={{"symbol":"{tv}","adjustment":"splits"}}'
+                self._tv_send_unlocked(ws, "chart_create_session", [chart_session, ""])
+                self._tv_send_unlocked(ws, "quote_add_symbols", [qs, tv])
+                self._tv_send_unlocked(
+                    ws,
+                    "resolve_symbol",
+                    [chart_session, f"symbol_{self._tv_timeframe}", symbol_string],
+                )
+                self._tv_send_unlocked(
+                    ws,
+                    "create_series",
+                    [
+                        chart_session,
+                        f"s{self._tv_timeframe}",
+                        f"s{self._tv_timeframe}",
+                        f"symbol_{self._tv_timeframe}",
+                        self._tv_timeframe,
+                        self._tv_candles,
+                    ],
+                )
+                self._tv_subscribed.add(tv)
+                new_syms.append(tv)
+
+        if new_syms:
+            self._logger.info("TradingView new subscriptions: %s", new_syms)
+        if self._tv_subscribed and not self._tv_subscriptions_logged:
+            self._tv_subscriptions_logged = True
+            with self._tv_lock:
+                active = sorted(self._tv_subscribed)
+            self._logger.info("TradingView subscription list: %s", active)
+
+    def _ensure_tv_reader_thread(self) -> None:
+        if self._tv_reader_thread is not None and self._tv_reader_thread.is_alive():
+            return
+
+        def reader_loop() -> None:
+            while not self._tv_reader_stop.is_set():
+                ws_local = None
+                with self._tv_lock:
+                    ws_local = self._tv_ws
+                if ws_local is None:
+                    time.sleep(0.15)
                     continue
                 try:
-                    payload = json.loads(chunk)
-                except json.JSONDecodeError:
+                    raw = ws_local.recv()
+                except Exception as exc:
+                    self._logger.warning("TradingView WebSocket recv ended: %s", exc)
+                    with self._tv_lock:
+                        if self._tv_ws is ws_local:
+                            self._tv_close_internal_unlocked()
+                            self._tv_subscribed.clear()
+                            self._tv_symbol_to_normalized.clear()
                     continue
+                try:
+                    self._process_tv_raw(raw)
+                except Exception:
+                    self._logger.debug("TradingView message handler error", exc_info=True)
 
-                if payload.get("m") == "critical_error":
-                    self._logger.warning("TradingView critical_error for %s: %s", tv_symbol, payload)
-                    params = payload.get("p", [])
-                    if len(params) >= 3 and params[2] == "quote_add_symbols":
-                        raise RuntimeError(f"TradingView invalid_parameters for quote_add_symbols: {payload}")
+        self._tv_reader_thread = threading.Thread(
+            target=reader_loop, daemon=True, name="tradingview-ws-reader"
+        )
+        self._tv_reader_thread.start()
 
-                self._logger.debug("TradingView parsed payload for %s: %s", tv_symbol, payload)
-                selected = self._select_realtime_price(payload)
-                if selected is not None:
-                    return selected
+    def _process_tv_raw(self, raw: str) -> None:
+        data_chunks = re.split(r"~m~\d+~m~", raw)
+        for chunk in data_chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                payload = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("m") == "critical_error":
+                self._logger.warning("TradingView critical_error: %s", payload)
+                with self._tv_lock:
+                    if self._tv_ws is not None:
+                        self._tv_close_internal_unlocked()
+                        self._tv_subscribed.clear()
+                        self._tv_symbol_to_normalized.clear()
+                continue
+            sym, price = self._parse_qsd_symbol_and_price(payload)
+            if sym and price is not None:
+                with self._tv_lock:
+                    self._tv_prices[sym] = price
+                    display = self._tv_symbol_to_normalized.get(sym, sym)
+                self._logger.info(
+                    "price update: %s = %s (source=tradingview)",
+                    display,
+                    price,
+                )
+                continue
+            fallback = self._select_realtime_price(payload)
+            if fallback is not None:
+                with self._tv_lock:
+                    subs = list(self._tv_subscribed)
+                    if len(subs) == 1:
+                        only = subs[0]
+                        self._tv_prices[only] = fallback
+                        display = self._tv_symbol_to_normalized.get(only, only)
+                    else:
+                        display = None
+                if display is not None:
+                    self._logger.info(
+                        "price update: %s = %s (source=tradingview)",
+                        display,
+                        fallback,
+                    )
 
-        self._logger.warning("NO DATA FROM TRADINGVIEW for %s", tv_symbol)
-        raise TimeoutError(f"No data from TradingView for {tv_symbol} in {self._TV_TIMEOUT_SECONDS}s")
+    def _parse_qsd_symbol_and_price(self, payload: dict[str, Any]) -> tuple[str | None, float | None]:
+        if payload.get("m") != "qsd":
+            return None, None
+        p = payload.get("p")
+        if not isinstance(p, list) or not p:
+            return None, None
+        block: dict[str, Any] | None = None
+        if len(p) >= 2 and isinstance(p[1], dict):
+            block = p[1]
+        elif isinstance(p[0], dict):
+            block = p[0]
+        if block is None:
+            return None, None
+        sym_raw = block.get("n") or block.get("nl") or block.get("name")
+        sym = str(sym_raw) if sym_raw else None
+        v = block.get("v")
+        if not isinstance(v, dict):
+            return sym, None
+        price = self._price_from_quote_v(v)
+        return sym, price
+
+    @staticmethod
+    def _price_from_quote_v(v: dict[str, Any]) -> float | None:
+        last_price = PriceService._find_first_numeric_by_keys(v, {"last", "lp", "last_price"})
+        if last_price is not None:
+            return last_price
+        bid = PriceService._find_first_numeric_by_keys(v, {"bid", "bp", "bid_price"})
+        ask = PriceService._find_first_numeric_by_keys(v, {"ask", "ap", "ask_price"})
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+        if bid is not None:
+            return bid
+        if ask is not None:
+            return ask
+        return None
 
     @staticmethod
     def _select_realtime_price(payload: Dict[str, Any]) -> float | None:
@@ -357,4 +534,3 @@ class PriceService:
             return symbol
         exchange, ticker = symbol.split(":", 1)
         return f"{self._EXCHANGE_REMAP.get(exchange, exchange)}:{ticker}"
-

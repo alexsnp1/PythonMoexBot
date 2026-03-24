@@ -4,6 +4,20 @@ from price.price_service import PriceService
 
 
 class PriceServiceRealtimeParserTests(unittest.TestCase):
+    def test_masks_long_token(self) -> None:
+        self.assertEqual(PriceService._mask_token("abcdef123456"), "abc***456")
+
+    def test_masks_short_token(self) -> None:
+        self.assertEqual(PriceService._mask_token("short"), "***")
+
+    def test_parse_qsd_with_exchange_symbol(self) -> None:
+        ps = PriceService()
+        sym, price = ps._parse_qsd_symbol_and_price(
+            {"m": "qsd", "p": ["qs_x", {"n": "MOEX:FOO", "v": {"lp": 12.5}}]}
+        )
+        self.assertEqual(sym, "MOEX:FOO")
+        self.assertEqual(price, 12.5)
+
     def test_selects_last_price_with_priority(self) -> None:
         payload = {"m": "qsd", "p": [{"v": {"lp": 104.7, "bid": 104.6, "ask": 104.8}}]}
         selected = PriceService._select_realtime_price(payload)
