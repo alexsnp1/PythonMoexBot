@@ -1,35 +1,16 @@
-# Python compiled files
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.sqlite3
 
-# Virtual environments (если будут)
-venv/
-env/
-*.venv/
-
-# Базы данных
-*.sqlite
-*.db
-
-# Конфиги с токенами и паролями
-.env
-*.env
-
-# IDE / OS
-.idea/
-*.iml
-.vscode/
+# MacOS
 .DS_Store
+.Trash/
 *.swp
-*.swo
-*.bak
-*.tmp
 
-# Логи
-*.log
-
-# Кэш
-*.cache/
-.cache/
+# Cursor / IDE
+.idea/
+.vscode/
+*.iml

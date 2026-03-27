@@ -30,8 +30,9 @@ class DatabaseService:
             conn.commit()
 
     def add_rule(self, user_id: int, formula: str, upper: float, lower: float) -> int:
+        """Append a rule; returns its 1-based position (same as len(rules) after insert)."""
         with self._connect() as conn:
-            cur = conn.execute(
+            conn.execute(
                 """
                 INSERT INTO rules (user_id, formula, upper_bound, lower_bound, last_alert_time)
                 VALUES (?, ?, ?, ?, NULL)
@@ -39,9 +40,15 @@ class DatabaseService:
                 (user_id, formula, upper, lower),
             )
             conn.commit()
-            return int(cur.lastrowid)
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM rules WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return int(row["c"])
 
     def list_rules(self, user_id: int) -> List[SpreadRule]:
+        # ORDER BY id defines insertion order (append semantics). For explicit reordering,
+        # consider adding a position column later.
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -52,7 +59,7 @@ class DatabaseService:
                 """,
                 (user_id,),
             ).fetchall()
-        return [self._row_to_rule(row) for row in rows]
+        return [self._row_to_rule(row, rule_number=i) for i, row in enumerate(rows, start=1)]
 
     def list_all_rules(self) -> List[SpreadRule]:
         with self._connect() as conn:
@@ -60,21 +67,47 @@ class DatabaseService:
                 """
                 SELECT id, user_id, formula, upper_bound, lower_bound, last_alert_time
                 FROM rules
-                ORDER BY id ASC
+                ORDER BY user_id ASC, id ASC
                 """
             ).fetchall()
-        return [self._row_to_rule(row) for row in rows]
+        rules: List[SpreadRule] = []
+        per_user: dict[int, int] = {}
+        for row in rows:
+            uid = int(row["user_id"])
+            per_user[uid] = per_user.get(uid, 0) + 1
+            rules.append(self._row_to_rule(row, rule_number=per_user[uid]))
+        return rules
 
-    def remove_rule(self, user_id: int, rule_id: int) -> bool:
+    def list_distinct_user_ids_with_rules(self) -> List[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM rules
+                ORDER BY user_id ASC
+                """
+            ).fetchall()
+        return [int(r["user_id"]) for r in rows]
+
+    def remove_rule(self, user_id: int, rule_number: int) -> bool:
+        """rule_number is 1-based index in the user's ordered list (like list index + 1)."""
+        rules = self.list_rules(user_id)
+        if rule_number < 1 or rule_number > len(rules):
+            return False
+        row_id = rules[rule_number - 1].id
         with self._connect() as conn:
             cur = conn.execute(
                 "DELETE FROM rules WHERE id = ? AND user_id = ?",
-                (rule_id, user_id),
+                (row_id, user_id),
             )
             conn.commit()
             return cur.rowcount > 0
 
-    def update_rule_bounds(self, user_id: int, rule_id: int, upper: float, lower: float) -> bool:
+    def update_rule_bounds(self, user_id: int, rule_number: int, upper: float, lower: float) -> bool:
+        rules = self.list_rules(user_id)
+        if rule_number < 1 or rule_number > len(rules):
+            return False
+        row_id = rules[rule_number - 1].id
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -82,7 +115,7 @@ class DatabaseService:
                 SET upper_bound = ?, lower_bound = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (upper, lower, rule_id, user_id),
+                (upper, lower, row_id, user_id),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -103,7 +136,7 @@ class DatabaseService:
         return conn
 
     @staticmethod
-    def _row_to_rule(row: sqlite3.Row) -> SpreadRule:
+    def _row_to_rule(row: sqlite3.Row, rule_number: int = 0) -> SpreadRule:
         return SpreadRule(
             id=int(row["id"]),
             user_id=int(row["user_id"]),
@@ -111,5 +144,6 @@ class DatabaseService:
             upper_bound=float(row["upper_bound"]),
             lower_bound=float(row["lower_bound"]),
             last_alert_time=int(row["last_alert_time"]) if row["last_alert_time"] is not None else None,
+            rule_number=rule_number,
         )
 

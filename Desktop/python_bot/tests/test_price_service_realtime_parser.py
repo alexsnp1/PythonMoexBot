@@ -18,6 +18,18 @@ class PriceServiceRealtimeParserTests(unittest.TestCase):
         self.assertEqual(sym, "MOEX:FOO")
         self.assertEqual(price, 12.5)
 
+    def test_parse_token_expires_at_unix(self) -> None:
+        self.assertEqual(PriceService.parse_tradingview_token_expires_at("1700000000"), 1700000000)
+
+    def test_parse_token_expires_at_iso_z(self) -> None:
+        ts = PriceService.parse_tradingview_token_expires_at("2024-01-15T12:00:00Z")
+        self.assertIsNotNone(ts)
+        self.assertGreater(ts, 1_700_000_000)
+
+    def test_mask_token_for_ui(self) -> None:
+        self.assertEqual(PriceService.mask_token("short"), "***")
+        self.assertEqual(PriceService.mask_token("12345678901"), "123456...8901")
+
     def test_selects_last_price_with_priority(self) -> None:
         payload = {"m": "qsd", "p": [{"v": {"lp": 104.7, "bid": 104.6, "ask": 104.8}}]}
         selected = PriceService._select_realtime_price(payload)

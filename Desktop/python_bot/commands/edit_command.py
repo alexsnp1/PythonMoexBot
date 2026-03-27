@@ -18,26 +18,32 @@ def configure_edit_command(db: DatabaseService) -> None:
 
         parts = message.text.split(maxsplit=3)
         if len(parts) != 4:
-            await message.answer("Usage: /edit <id> <upper> <lower>")
+            await message.answer("Usage: /edit <n> <upper> <lower>  (n = rule number from /list)")
             return
 
-        _, rule_id_str, upper_str, lower_str = parts
+        _, rule_n_str, upper_str, lower_str = parts
         try:
-            rule_id = int(rule_id_str)
+            rule_number = int(rule_n_str)
             upper = float(upper_str)
             lower = float(lower_str)
         except ValueError:
-            await message.answer("id must be integer, upper/lower must be numbers.")
+            await message.answer("Rule number must be an integer; upper/lower must be numbers.")
+            return
+
+        rules = db.list_rules(user_id=message.from_user.id)
+        index = rule_number - 1
+        if index < 0 or index >= len(rules):
+            await message.answer("Rule not found")
             return
 
         updated = db.update_rule_bounds(
             user_id=message.from_user.id,
-            rule_id=rule_id,
+            rule_number=rule_number,
             upper=upper,
             lower=lower,
         )
         if updated:
-            await message.answer(f"Rule #{rule_id} updated: upper={upper}, lower={lower}")
+            await message.answer(f"Rule #{rule_number} updated: upper={upper}, lower={lower}")
         else:
-            await message.answer("Rule not found or does not belong to you.")
+            await message.answer("Rule not found")
 
